@@ -119,6 +119,11 @@ async def sign_in():
         await state["page"].goto(HOME, wait_until="domcontentloaded")
         if await wait_ready(state["page"], 15):
             return
+        if HEADLESS and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+            print("sign-in needed, but there is no display here to open a login window", flush=True)
+            raise RuntimeError("The Google session expired and this machine has no display for signing in. "
+                               "Sign in again with the login helper (copy a fresh session into the bridge's profile), "
+                               "then restart the bridge.")
         print("sign-in needed: opening a browser window - log in there", flush=True)
         if HEADLESS:
             await open_browser(headless=False)
@@ -146,20 +151,28 @@ async def sign_in():
 
 # ---------- request translation ----------
 
-TOOL_RULES = """You are connected to tools that run on the user's computer. To use one, output a block exactly like:
-<tool_call>{"name": "TOOL_NAME", "arguments": {...}}</tool_call>
-Rules:
-- The JSON must be valid and on one line; "arguments" must match the tool's parameter schema.
-- You may output several <tool_call> blocks in one reply (they run in order). Put any short explanation BEFORE them.
-- After your last <tool_call>, STOP. Never write <tool_result> blocks yourself; real results come back in the next turn.
-- If no tool is needed, just answer normally with no <tool_call> block.
-- These tools are the ONLY way to touch the user's files, shell or machine. Never transfer to another agent and never use built-in code execution (e.g. file_and_coding_agent): that runs in a remote sandbox that cannot see the user's files. To run code, use the user's shell tool.
+TOOL_RULES = """You can use the tools listed below; they run on the user's computer. To use a tool, write a fenced code block with the language tag `tool`, containing one JSON object with the tool name and its input. Example:
+```tool
+{"tool": "TOOL_NAME", "input": {...}}
+```
+Notes:
+- One JSON object per block, valid JSON, and "input" must match the tool's input schema. Several blocks are fine (they run in order); put any short explanation before them.
+- After your last block, stop. Results come back in the next message; never write them yourself.
+- If no tool is needed, just answer normally with no tool block.
+- These tools are the only way to touch the user's files, shell or machine. Do not hand off to other agents or use built-in code execution (such as file_and_coding_agent); it runs remotely and cannot see the user's files. To run code, use the user's shell tool.
 Available tools (JSON schema):
 """
 
 
 MIME_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp",
             "application/pdf": "pdf", "text/plain": "txt"}
+
+
+def fence(body):
+    """Wrap text in a code fence longer than any backtick run inside it."""
+    longest = max((len(r) for r in re.findall(r"`{3,}", body or "")), default=2)
+    f = "`" * (longest + 1)
+    return f"{f}\n{body}\n{f}"
 
 
 def render(messages, tools):
@@ -196,18 +209,22 @@ def render(messages, tools):
     if len(messages) == 1 and not tools:
         return text(messages[0]["content"]), attachments
     turns = []
+    call_names = {}
     for m in messages:
         if m["role"] == "tool":
-            turns.append(f'<tool_result id="{m.get("tool_call_id", "")}">\n{text(m.get("content"))}\n</tool_result>')
+            out = text(m.get("content"))
+            name = call_names.get(m.get("tool_call_id"), "tool")
+            turns.append(f"<tool_output>\nOutput of the {name} call:\n{fence(out)}\n</tool_output>")
             continue
         body = text(m.get("content"))
         for tc in m.get("tool_calls") or []:
             f = tc["function"]
+            call_names[tc.get("id")] = f["name"]
             try:
                 args = json.loads(f.get("arguments") or "{}")
             except json.JSONDecodeError:
                 args = f.get("arguments")
-            body += "\n<tool_call>" + json.dumps({"name": f["name"], "arguments": args}) + "</tool_call>"
+            body += "\n```tool\n" + json.dumps({"tool": f["name"], "input": args}) + "\n```"
         turns.append(f"<{m['role']}>\n{body.strip()}\n</{m['role']}>")
     head = ("The conversation so far is below. Reply as the assistant to the last message. "
             "Output only your reply, without role tags.")
@@ -220,41 +237,47 @@ def render(messages, tools):
     if tools:
         specs = [t["function"] for t in tools if t.get("type") == "function"]
         head += "\n\n" + TOOL_RULES + json.dumps(specs)
-        tail = "\n\n(Reminder: act through <tool_call> blocks, then stop and wait for results.)"
+        tail = "\n\n(Use ```tool blocks for any actions, then stop and wait for the results.)"
     return head + "\n\n" + "\n\n".join(turns) + tail, attachments
 
 
 CALL_RE = re.compile(r"<tool_call>\s*(?:```(?:json)?\s*)?(\{.*?\})\s*(?:```\s*)?</tool_call>", re.S)
+# A raw newline cannot occur inside a JSON string, so the first "\n```" after the opening fence ends the block.
+FENCE_RE = re.compile(r"^[ \t]*```+[ \t]*tool[ \t]*\n(.*?)\n[ \t]*```+[ \t]*$", re.S | re.M)
 
 
 BLOCKED = "blocked by your organization's content policy"
 
 
 def split_calls(answer):
-    """Pull <tool_call> blocks out of the reply as OpenAI tool_calls.
+    """Pull tool blocks (```tool fences, or legacy <tool_call> tags) out of the reply as OpenAI tool_calls.
 
     Returns (text, calls, problem); problem describes a malformed/truncated call, else ''.
     """
-    calls, problem = [], ""
-    for m in CALL_RE.finditer(answer):
+    calls, problem, first = [], "", None
+    matches = sorted([(m.start(), m.group(1)) for m in FENCE_RE.finditer(answer)] +
+                     [(m.start(), m.group(1)) for m in CALL_RE.finditer(answer)])
+    for start, raw in matches:
+        first = start if first is None else first
         try:
-            obj = json.loads(m.group(1))
+            obj = json.loads(raw)
         except json.JSONDecodeError as e:
-            problem = f"invalid JSON in a <tool_call> ({e.msg} at char {e.pos}): {m.group(1)[:200]}"
+            problem = f"invalid JSON in a tool block ({e.msg} at char {e.pos}): {raw[:200]}"
             continue
-        if not isinstance(obj, dict) or "name" not in obj:
-            problem = "a <tool_call> is missing \"name\""
+        name = obj.get("tool", obj.get("name")) if isinstance(obj, dict) else None
+        if not name:
+            problem = 'a tool block is missing "tool"'
             continue
-        args = obj.get("arguments", obj.get("parameters", {}))
+        args = obj.get("input", obj.get("arguments", obj.get("parameters", {})))
         calls.append({"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function",
-                      "function": {"name": obj["name"],
-                                   "arguments": args if isinstance(args, str) else json.dumps(args)}})
-    if answer.count("<tool_call>") > len(CALL_RE.findall(answer)):
-        problem = "a <tool_call> block was not closed with </tool_call> or is not a single JSON object"
-    if "<tool_call>" not in answer:
+                      "function": {"name": name, "arguments": args if isinstance(args, str) else json.dumps(args)}})
+    opened = len(re.findall(r"^[ \t]*```+[ \t]*tool[ \t]*$", answer, re.M)) + answer.count("<tool_call>")
+    if opened > len(matches):
+        problem = "a ```tool block was not closed with ``` or does not hold a single JSON object"
+    if first is None:
         return answer, [], problem
     # Keep only text before the first call; drop anything the model invented after it.
-    return answer[:answer.index("<tool_call>")].strip(), calls, problem
+    return answer[:first].strip(), calls, problem
 
 
 def extract(raw):
@@ -314,7 +337,16 @@ async def api(url, body=None, b64=None, content_type="application/json", headers
     args = {"url": url, "body": body, "bodyB64": b64, "contentType": content_type,
             "extraHeaders": headers or {}, "authuser": AUTHUSER}
     for attempt in range(2):
-        r = await state["page"].evaluate(CALL_JS, {**args, "serverToken": state["server_token"]})
+        try:
+            r = await state["page"].evaluate(CALL_JS, {**args, "serverToken": state["server_token"]})
+        except Exception as e:
+            if attempt or "closed" not in str(e).lower():
+                raise
+            print(f"browser was gone ({type(e).__name__}); relaunching it", flush=True)
+            await open_browser(headless=HEADLESS)
+            await state["page"].goto(HOME, wait_until="domcontentloaded")
+            await wait_ready(state["page"], 30)
+            continue
         if r["status"] in (401, 403) and attempt == 0:
             print(f"session expired (HTTP {r['status']}); signing in again", flush=True)
             await sign_in()
@@ -444,13 +476,19 @@ async def chat(req: Request):
     try:
         # Blocked by the org content filter -> retry with less history (a blocked item in the
         # history would otherwise poison every later request). Malformed tool call -> ask again.
-        level, note = 0, ""
-        for attempt in range(5):
+        level, note, reasks = 0, "", 0
+        for attempt in range(7):
             prompt, attachments = render(trim_history(messages, level), tools)
             answer = await ask(prompt + note, model, attachments, effort)
             text, calls, problem = split_calls(answer) if tools else (answer, [], "")
             if BLOCKED in answer:
                 (HERE / "blocked_prompt.txt").write_text(prompt, encoding="utf-8")  # for diagnosing the filter
+                # The filter judged the model's reply, not the prompt: replies vary, so just ask again
+                # with the full history (up to twice) before giving up context.
+                if "response violated" in answer and reasks < 2:
+                    reasks += 1
+                    print(f"reply blocked by content filter; asking again ({reasks}/2)", flush=True)
+                    continue
                 # Level 2 drops this turn's tool results; only do that when there are none, or the
                 # model forgets what it just found and loops on the same tool calls.
                 if level == 2 or (level == 1 and messages[-1]["role"] != "user"):
@@ -459,11 +497,11 @@ async def chat(req: Request):
                 print(f"blocked by content filter{answer[answer.find('(Filter reason'):][:150] if '(Filter reason' in answer else ''}; "
                       f"retrying with less history (level {level})", flush=True)
                 continue
-            if not problem or attempt == 4:
+            if not problem or attempt == 6:
                 break
             print(f"retrying ({problem[:120]})", flush=True)
-            note = (f"\n\n(Note: {problem}. Send your full reply again, with every <tool_call> as one valid "
-                    "JSON object on one line; arrays must use [ ].)")
+            note = (f"\n\n(Note: {problem}. Send your full reply again, with every ```tool block holding one "
+                    "valid JSON object on one line; arrays must use [ ].)")
     except RuntimeError as e:
         return JSONResponse({"error": {"message": str(e), "type": "upstream_error"}}, status_code=502)
     if BLOCKED in text and not calls:
