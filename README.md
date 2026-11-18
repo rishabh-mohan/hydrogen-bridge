@@ -10,7 +10,7 @@ Set up for **Purdue's** Gemini Enterprise out of the box. Other organizations ca
 
 ## What you get
 
-- Models: `gemini-4-hydrogen`, `gemini-4-carbon`, `claude-opus-5-5`, `claude-sonnet-5-5` (whatever your org enables). Switch with `/models` in OpenCode.
+- Models: Gemini 4 Hydrogen / Carbon / Argon, Gemini 3.8 / 3.7 / 3.5 Flash, Gemini 3.1 Pro, Gemini 2.5 Pro, Claude Opus 5.5 and Claude Sonnet 5.5. The bridge asks Google which models your org offers at startup (`/v1/models`). Switch with `/models` in OpenCode.
 - Effort levels (OpenCode variants): low / medium / high, plus minimal for Claude.
 - Tool use (read, edit, run commands) emulated through the chat.
 - Image and PDF attachments.
@@ -41,11 +41,13 @@ The first run opens a browser window. Sign in to Gemini Enterprise there, and it
 
 With `-BridgeOnly`, any OpenAI-compatible client can use base URL `http://127.0.0.1:8766/v1` with any API key.
 
+To use the bridge from another machine (for example, run it on a headless server once you have a signed-in `profile/`), set `HOST` to the address it should listen on (default `127.0.0.1`). The bridge accepts any API key, so only bind it to a private network such as Tailscale, never a public interface.
+
 If you are signed in to several Google accounts, set `AUTHUSER` (for example `$env:AUTHUSER = "1"`) to the account index from the web app's URL (`/u/1/`).
 
 ## Content filter
 
-Organizations can run Google's Model Armor on prompts *and* replies. When a reply is blocked, the bridge retries once with less history. If it is still blocked, the task stops with a note saying which filter fired. Say "continue" to try again, or rephrase.
+Organizations can run Google's Model Armor on prompts *and* replies. When the model's reply is blocked, the bridge asks again (up to twice), since replies vary. If it is still blocked, the bridge retries with less history. If that fails too, the task stops with a note saying which filter fired. Say "continue" to try again, or rephrase.
 
 ## Using another organization
 
