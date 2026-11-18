@@ -1,0 +1,6 @@
+# Runtime files: browser profile (holds your Google session), logs, and saved replies (hold your prompts).
+profile/
+__pycache__/
+*.log
+last_response.txt
+blocked_prompt.txt
