@@ -41,6 +41,8 @@ The first run opens a browser window. Sign in to Gemini Enterprise there, and it
 
 With `-BridgeOnly`, any OpenAI-compatible client can use base URL `http://127.0.0.1:8766/v1` with any API key.
 
+To use the bridge from another machine (for example, run it on a headless server once you have a signed-in `profile/`), set `HOST` to the address it should listen on (default `127.0.0.1`). The bridge accepts any API key, so only bind it to a private network such as Tailscale, never a public interface.
+
 If you are signed in to several Google accounts, set `AUTHUSER` (for example `$env:AUTHUSER = "1"`) to the account index from the web app's URL (`/u/1/`).
 
 ## Content filter

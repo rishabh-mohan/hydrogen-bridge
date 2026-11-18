@@ -30,6 +30,7 @@ ENDPOINT = f"https://us-discoveryengine.clients6.google.com/v1alpha/locations/us
 HOME = f"https://vertexaisearch.cloud.google.com/us/home/cid/{CONFIG_ID}"
 AUTHUSER = os.environ.get("AUTHUSER", "0")
 PORT = int(os.environ.get("PORT", "8766"))
+HOST = os.environ.get("HOST", "127.0.0.1")
 DEFAULT_MODEL = os.environ.get("MODEL", "gemini-4-hydrogen")
 HEADLESS = os.environ.get("HEADLESS") == "1"
 LOGIN_TIMEOUT = int(os.environ.get("LOGIN_TIMEOUT", "600"))  # seconds to wait for you to sign in
@@ -152,6 +153,7 @@ Rules:
 - You may output several <tool_call> blocks in one reply (they run in order). Put any short explanation BEFORE them.
 - After your last <tool_call>, STOP. Never write <tool_result> blocks yourself; real results come back in the next turn.
 - If no tool is needed, just answer normally with no <tool_call> block.
+- These tools are the ONLY way to touch the user's files, shell or machine. Never transfer to another agent and never use built-in code execution (e.g. file_and_coding_agent): that runs in a remote sandbox that cannot see the user's files. To run code, use the user's shell tool.
 Available tools (JSON schema):
 """
 
@@ -256,18 +258,38 @@ def split_calls(answer):
 
 
 def extract(raw):
-    """Collect answer text from the streamed response, skipping 'thought' parts."""
+    """Collect answer text from the streamed response, skipping 'thought' parts.
+
+    Gemini Enterprise's root agent sometimes hands the turn to a built-in sub-agent
+    (transfer_to_agent, e.g. file_and_coding_agent). Its "I'll hand this off..." chatter
+    is dropped; the sub-agent's answer is kept. If the sub-agent wrote no text, its code
+    output stands in, and failing that the pre-handoff text is kept.
+    """
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
         data = [json.loads(l.strip().strip(",[]")) for l in raw.splitlines() if l.strip().strip(",[]")]
-    out, reasons = [], []
+    chunks = data if isinstance(data, list) else [data]
+    out, before, code_out, reasons, handoffs = [], [], [], [], set()
 
     def walk(x):
         if isinstance(x, dict):
             c = x.get("content")
-            if isinstance(c, dict) and isinstance(c.get("text"), str) and not c.get("thought"):
-                out.append(c["text"])
+            if isinstance(c, dict):
+                if isinstance(c.get("text"), str) and not c.get("thought"):
+                    out.append(c["text"])
+                r = c.get("codeExecutionResult")
+                if isinstance(r, dict) and isinstance(r.get("output"), str):
+                    code_out.append(r["output"])
+            fc = x.get("functionCall")
+            # The final summary chunk repeats earlier calls, so count each handoff once.
+            if isinstance(fc, dict) and fc.get("functionName") == "transfer_to_agent" \
+                    and fc.get("functionId") not in handoffs:
+                handoffs.add(fc.get("functionId"))
+                print(f"upstream handed off to {(fc.get('args') or {}).get('agent_name', '?')}", flush=True)
+                before.extend(out)
+                out.clear()
+                code_out.clear()
             if isinstance(x.get("modelArmorViolation"), str):
                 reasons.append(x["modelArmorViolation"])
             for k, v in x.items():
@@ -277,9 +299,11 @@ def extract(raw):
             for v in x:
                 walk(v)
 
-    walk(data)
+    for chunk in chunks:
+        walk(chunk)
+    parts = out or ([o.strip() for o in code_out[-1:]] if code_out else before)
     # Drop the web app's display-only "[[section:Title]]" markers.
-    text = re.sub(r"\[\[section:[^\]\n]*\]\]\n?", "", "".join(out))
+    text = re.sub(r"\[\[section:[^\]\n]*\]\]\n?", "", "".join(parts))
     if reasons:  # say which filter fired, so a blocked stop isn't a mystery
         text += "\n(Filter reason: " + "; ".join(dict.fromkeys(reasons)) + ")"
     return text
@@ -404,9 +428,12 @@ async def chat(req: Request):
     if not model.startswith(("gemini-", "claude-")):  # tools often send placeholder names like "gpt-4"
         model = DEFAULT_MODEL
     effort = (payload.get("reasoning_effort") or "").lower()
-    m = re.match(r"(.+)-(minimal|low|medium|high)$", model)
-    if m:  # also accept effort as a model-name suffix, e.g. claude-opus-5-5-high
+    m = re.match(r"(.+)-(minimal|low|medium|high|xhigh|max)$", model)
+    if m:  # also accept effort as a model-name suffix, e.g. gemini-4-hydrogen-high
         model, effort = m.group(1), effort or m.group(2)
+    effort = {"xhigh": "high", "max": "high"}.get(effort, effort)
+    if model.startswith("gemini-") and effort == "minimal":
+        effort = "low"  # Gemini rejects MINIMAL with HTTP 500; LOW is its lowest level
     effort = effort.upper() if effort in ("minimal", "low", "medium", "high") else None
     if effort:
         print(f"{model} effort={effort}", flush=True)
@@ -467,4 +494,4 @@ async def chat(req: Request):
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=PORT)
+    uvicorn.run(app, host=HOST, port=PORT)
