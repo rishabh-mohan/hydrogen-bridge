@@ -390,6 +390,32 @@ async def api(url, body=None, b64=None, content_type="application/json", headers
         return r
 
 
+async def discover_models():
+    """Ask Gemini Enterprise which models this org's web app offers ({id: display name})."""
+    body = {"configId": CONFIG_ID, "additionalParams": {"token": "-", "origin": "ORIGIN_UNSPECIFIED"},
+            "widgetConfigId": CONFIG_ID, "modelInfoView": "END_USER_WEB"}
+    r = await api(f"{API}/v1alpha/locations/us/lookupWidgetConfig?key={WEB_KEY}", json.dumps(body))
+
+    def find(x):
+        if isinstance(x, dict):
+            if isinstance(x.get("resolvedModels"), list):
+                return x["resolvedModels"]
+            x = list(x.values())
+        if isinstance(x, list):
+            for v in x:
+                hit = find(v)
+                if hit:
+                    return hit
+        return None
+
+    try:
+        found = find(json.loads(r["text"])) if r["status"] == 200 else None
+    except json.JSONDecodeError:
+        found = None
+    state["models"] = {m["modelId"]: m.get("displayName", "") for m in found or [] if m.get("modelId")}
+    print("models:", ", ".join(state["models"]) or f"(lookup failed: HTTP {r['status']}; using defaults)", flush=True)
+
+
 def widget(method, request_key, request):
     return (f"{API}/v1alpha/locations/us/{method}?key={WEB_KEY}",
             json.dumps({"configId": CONFIG_ID, "additionalParams": {"token": "-", "origin": "ORIGIN_UNSPECIFIED"},
@@ -458,6 +484,7 @@ async def lifespan(app):
         state["pw"] = p
         await open_browser(headless=HEADLESS)
         await sign_in()
+        await discover_models()
         print(f"Bridge on http://127.0.0.1:{PORT}/v1", flush=True)
         yield
         await state["ctx"].close()
@@ -468,8 +495,11 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/v1/models")
 async def models():
-    ids = dict.fromkeys([DEFAULT_MODEL, "gemini-4-hydrogen", "gemini-4-carbon", "claude-opus-5-5", "claude-sonnet-5-5"])
-    return {"object": "list", "data": [{"id": i, "object": "model", "owned_by": "gemini-enterprise"} for i in ids]}
+    found = state.get("models") or {}
+    ids = dict.fromkeys([DEFAULT_MODEL, *found] if found else
+                        [DEFAULT_MODEL, "gemini-4-hydrogen", "gemini-4-carbon", "claude-opus-5-5", "claude-sonnet-5-5"])
+    return {"object": "list", "data": [{"id": i, "object": "model", "owned_by": "gemini-enterprise",
+                                        **({"name": found[i]} if found.get(i) else {})} for i in ids]}
 
 
 def trim_history(messages, level):
