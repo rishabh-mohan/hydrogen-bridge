@@ -159,7 +159,11 @@ TOOL_RULES = """You can use the tools listed below; they run on the user's compu
 {"tool": "TOOL_NAME", "input": {...}}
 ```
 Notes:
-- One JSON object per block, valid JSON, and "input" must match the tool's input schema. Several blocks are fine (they run in order); put any short explanation before them.
+- One JSON object per block, valid JSON, and "input" must match the tool's input schema.
+- Every reply is a slow round trip, so BATCH: when you need several independent things (reading several files,
+  several searches, a glob plus the reads you already know you need), put ALL their tool blocks in ONE reply
+  (they run in order). Only wait for results when the next call truly depends on them. Put any short
+  explanation before the blocks.
 - After your last block, stop. Results come back in the next message; never write them yourself.
 - If no tool is needed, just answer normally with no tool block.
 {handoff}
