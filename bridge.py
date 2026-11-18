@@ -8,6 +8,7 @@ import base64
 import json
 import os
 import re
+import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -119,10 +120,12 @@ async def sign_in():
         await state["page"].goto(HOME, wait_until="domcontentloaded")
         if await wait_ready(state["page"], 15):
             return
-        if HEADLESS and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        # Only Linux needs DISPLAY/WAYLAND_DISPLAY for a window; Windows and macOS can always open one.
+        if HEADLESS and sys.platform.startswith("linux") \
+                and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
             print("sign-in needed, but there is no display here to open a login window", flush=True)
             raise RuntimeError("The Google session expired and this machine has no display for signing in. "
-                               "Sign in again with the login helper (copy a fresh session into the bridge's profile), "
+                               "Sign in on a machine with a display, copy its profile/ folder here, "
                                "then restart the bridge.")
         print("sign-in needed: opening a browser window - log in there", flush=True)
         if HEADLESS:
@@ -159,9 +162,16 @@ Notes:
 - One JSON object per block, valid JSON, and "input" must match the tool's input schema. Several blocks are fine (they run in order); put any short explanation before them.
 - After your last block, stop. Results come back in the next message; never write them yourself.
 - If no tool is needed, just answer normally with no tool block.
-- These tools are the only way to touch the user's files, shell or machine. Do not hand off to other agents or use built-in code execution (such as file_and_coding_agent); it runs remotely and cannot see the user's files. To run code, use the user's shell tool.
+{handoff}
 Available tools (JSON schema):
 """
+NO_HANDOFF = ("- These tools are the only way to touch the user's files, shell or machine. Do not hand off to other "
+              "agents or use built-in code execution (such as file_and_coding_agent); it runs remotely and cannot "
+              "see the user's files. To run code, use the user's shell tool.")
+# With uploads, the built-in file agent is the only thing that can open them, so allow it for those files.
+UPLOAD_HANDOFF = ("- These tools are the only way to touch the user's files, shell or machine. The one exception is "
+                  "the files uploaded with this message: open those with your built-in file access. Do not use "
+                  "built-in code execution for anything else; to run code, use the user's shell tool.")
 
 
 MIME_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp",
@@ -236,7 +246,7 @@ def render(messages, tools):
     tail = ""
     if tools:
         specs = [t["function"] for t in tools if t.get("type") == "function"]
-        head += "\n\n" + TOOL_RULES + json.dumps(specs)
+        head += "\n\n" + TOOL_RULES.replace("{handoff}", UPLOAD_HANDOFF if attachments else NO_HANDOFF) + json.dumps(specs)
         tail = "\n\n(Use ```tool blocks for any actions, then stop and wait for the results.)"
     return head + "\n\n" + "\n\n".join(turns) + tail, attachments
 
