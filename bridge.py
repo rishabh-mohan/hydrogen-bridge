@@ -243,7 +243,10 @@ def render(messages, tools):
 
 CALL_RE = re.compile(r"<tool_call>\s*(?:```(?:json)?\s*)?(\{.*?\})\s*(?:```\s*)?</tool_call>", re.S)
 # A raw newline cannot occur inside a JSON string, so the first "\n```" after the opening fence ends the block.
-FENCE_RE = re.compile(r"^[ \t]*```+[ \t]*tool[ \t]*\n(.*?)\n[ \t]*```+[ \t]*$", re.S | re.M)
+# A ```tool opener, wherever it sits (models sometimes glue it onto the end of a sentence).
+TOOL_OPEN_RE = re.compile(r"`{3,}[ \t]*tool\b")
+TOOL_CLOSE_RE = re.compile(r"\s*`{3,}")
+_json = json.JSONDecoder()
 
 
 BLOCKED = "blocked by your organization's content policy"
@@ -252,17 +255,39 @@ BLOCKED = "blocked by your organization's content policy"
 def split_calls(answer):
     """Pull tool blocks (```tool fences, or legacy <tool_call> tags) out of the reply as OpenAI tool_calls.
 
+    Each ```tool opener is followed by exactly one JSON object, decoded with a real JSON parser,
+    so backticks inside strings (e.g. Markdown file contents) can't end a block early, and a
+    missing or misplaced closing fence doesn't lose the call.
     Returns (text, calls, problem); problem describes a malformed/truncated call, else ''.
     """
-    calls, problem, first = [], "", None
-    matches = sorted([(m.start(), m.group(1)) for m in FENCE_RE.finditer(answer)] +
-                     [(m.start(), m.group(1)) for m in CALL_RE.finditer(answer)])
-    for start, raw in matches:
-        first = start if first is None else first
+    found, problem = [], ""  # (start, obj)
+    for m in TOOL_OPEN_RE.finditer(answer):
+        if any(start <= m.start() < end for start, end, _ in found):
+            continue  # an opener inside an earlier call's JSON string
+        i = m.end()
+        while i < len(answer) and answer[i] in " \t\r\n":
+            i += 1
         try:
-            obj = json.loads(raw)
+            obj, end = _json.raw_decode(answer, i)
         except json.JSONDecodeError as e:
-            problem = f"invalid JSON in a tool block ({e.msg} at char {e.pos}): {raw[:200]}"
+            problem = f"invalid JSON in a tool block ({e.msg} at char {e.pos - i}): {answer[i:i + 200]}"
+            found.append((m.start(), m.end(), None))
+            continue
+        close = TOOL_CLOSE_RE.match(answer, end)
+        found.append((m.start(), close.end() if close else end, obj))
+    for m in CALL_RE.finditer(answer):
+        if not any(start <= m.start() < end for start, end, _ in found):
+            try:
+                found.append((m.start(), m.end(), json.loads(m.group(1))))
+            except json.JSONDecodeError as e:
+                problem = f"invalid JSON in a tool block ({e.msg} at char {e.pos}): {m.group(1)[:200]}"
+                found.append((m.start(), m.end(), None))
+    if answer.count("<tool_call>") > len(CALL_RE.findall(answer)):
+        problem = "a <tool_call> block was not closed or is not a single JSON object"
+    found.sort(key=lambda f: f[0])
+    calls = []
+    for _, _, obj in found:
+        if obj is None:
             continue
         name = obj.get("tool", obj.get("name")) if isinstance(obj, dict) else None
         if not name:
@@ -271,13 +296,10 @@ def split_calls(answer):
         args = obj.get("input", obj.get("arguments", obj.get("parameters", {})))
         calls.append({"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function",
                       "function": {"name": name, "arguments": args if isinstance(args, str) else json.dumps(args)}})
-    opened = len(re.findall(r"^[ \t]*```+[ \t]*tool[ \t]*$", answer, re.M)) + answer.count("<tool_call>")
-    if opened > len(matches):
-        problem = "a ```tool block was not closed with ``` or does not hold a single JSON object"
-    if first is None:
+    if not found:
         return answer, [], problem
     # Keep only text before the first call; drop anything the model invented after it.
-    return answer[:first].strip(), calls, problem
+    return answer[:found[0][0]].strip(), calls, problem
 
 
 def extract(raw):
