@@ -18,8 +18,10 @@ from urllib.parse import urlparse
 import asyncio
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 from playwright.async_api import async_playwright
+from transport import BrowserTransport, BridgeError, CALL_JS
+from request_runtime import chat_response
 
 HERE = Path(__file__).parent
 # Org-specific IDs. Defaults are Purdue's; other orgs: see README ("Using another organization").
@@ -38,33 +40,6 @@ LOGIN_TIMEOUT = int(os.environ.get("LOGIN_TIMEOUT", "600"))  # seconds to wait f
 
 PROJECT = os.environ.get("GE_PROJECT", "projects/399990213106/locations/us")
 API = "https://us-discoveryengine.clients6.google.com"
-
-# body: a string (sent as-is) or bodyB64: base64 bytes. Returns status, text, and the resumable-upload URL header.
-CALL_JS = """
-async ({url, body, bodyB64, contentType, extraHeaders, authuser, serverToken}) => {
-  const m = document.cookie.match(/(?:^|; )SAPISID=([^;]+)/);
-  if (!m) return {status: 401, text: 'no SAPISID cookie (signed out)'};
-  const ts = Math.floor(Date.now() / 1000);
-  const buf = await crypto.subtle.digest('SHA-1',
-      new TextEncoder().encode(`${ts} ${m[1]} ${location.origin}`));
-  const h = ts + '_' + [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
-  const headers = {
-    'Content-Type': contentType,
-    'Authorization': `SAPISIDHASH ${h} SAPISID1PHASH ${h} SAPISID3PHASH ${h}`,
-    'X-Goog-AuthUser': authuser,
-    'X-Goog-Api-Client': 'gemini-enterprise-classic/1.0.0',
-    ...extraHeaders,
-  };
-  if (serverToken) headers['X-Server-Token'] = serverToken;
-  const payload = bodyB64 != null ? Uint8Array.from(atob(bodyB64), c => c.charCodeAt(0)) : body;
-  try {
-    const r = await fetch(url, {method: 'POST', headers, body: payload, credentials: 'include'});
-    return {status: r.status, text: await r.text(), uploadUrl: r.headers.get('x-goog-upload-url')};
-  } catch (e) {
-    return {status: 401, text: 'fetch failed (likely redirected to sign-in): ' + e};
-  }
-}
-"""
 
 state = {"page": None, "server_token": None, "login_lock": asyncio.Lock()}
 
@@ -94,8 +69,12 @@ def sniff(req):  # reuse the app's X-Server-Token if it sends one
 
 async def open_browser(headless):
     """(Re)launch the persistent browser profile, visible or headless."""
+    state["server_token"] = None
     if state.get("ctx"):
-        await state["ctx"].close()
+        try:
+            await state["ctx"].close()
+        except Exception:
+            pass  # The old browser may have crashed already.
     ctx = await state["pw"].chromium.launch_persistent_context(
         str(HERE / "profile"), headless=headless, viewport=None,
         ignore_default_args=["--enable-automation"],
@@ -368,26 +347,19 @@ def extract(raw):
     return text
 
 
+async def recover_browser(browser_gone):
+    if browser_gone:
+        await open_browser(headless=HEADLESS)
+    await sign_in()
+
+
+transport = BrowserTransport(state, CALL_JS, recover_browser)
+
+
 async def api(url, body=None, b64=None, content_type="application/json", headers=None):
-    """POST from inside the logged-in page; signs in again once if the session has expired."""
-    args = {"url": url, "body": body, "bodyB64": b64, "contentType": content_type,
-            "extraHeaders": headers or {}, "authuser": AUTHUSER}
-    for attempt in range(2):
-        try:
-            r = await state["page"].evaluate(CALL_JS, {**args, "serverToken": state["server_token"]})
-        except Exception as e:
-            if attempt or "closed" not in str(e).lower():
-                raise
-            print(f"browser was gone ({type(e).__name__}); relaunching it", flush=True)
-            await open_browser(headless=HEADLESS)
-            await state["page"].goto(HOME, wait_until="domcontentloaded")
-            await wait_ready(state["page"], 30)
-            continue
-        if r["status"] in (401, 403) and attempt == 0:
-            print(f"session expired (HTTP {r['status']}); signing in again", flush=True)
-            await sign_in()
-            continue
-        return r
+    return await transport.request({"url": url, "body": body, "bodyB64": b64,
+                                    "contentType": content_type,
+                                    "extraHeaders": headers or {}, "authuser": AUTHUSER})
 
 
 async def discover_models():
@@ -472,9 +444,12 @@ async def ask(prompt, model, attachments=(), effort=None):
     (HERE / "last_response.txt").write_text(f"HTTP {r['status']}\n{r['text']}", encoding="utf-8")
     if r["status"] != 200:
         raise RuntimeError(f"Gemini Enterprise returned HTTP {r['status']}: {r['text'][:500]}")
-    answer = extract(r["text"])
+    try:
+        answer = extract(r["text"])
+    except (ValueError, TypeError, KeyError) as exc:
+        raise BridgeError("Google returned an unreadable response; see last_response.txt.", "invalid_upstream_response") from exc
     if not answer:
-        raise RuntimeError("Got a response but found no answer text; see last_response.txt")
+        raise BridgeError("Google returned no answer text; see last_response.txt.", "empty_upstream_response")
     return answer
 
 
@@ -521,7 +496,14 @@ def trim_history(messages, level):
 
 @app.post("/v1/chat/completions")
 async def chat(req: Request):
-    payload = await req.json()
+    try:
+        payload = await req.json()
+    except (ValueError, UnicodeDecodeError):
+        return JSONResponse({"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}}, status_code=400)
+    return await chat_response(req, payload, complete)
+
+
+async def complete(payload):
     model = payload.get("model") or DEFAULT_MODEL
     if not model.startswith(("gemini-", "claude-")):  # tools often send placeholder names like "gpt-4"
         model = DEFAULT_MODEL
@@ -539,62 +521,40 @@ async def chat(req: Request):
     # Never send back earlier replies that were just the content-filter notice.
     messages = [m for m in payload["messages"]
                 if not (m.get("role") == "assistant" and BLOCKED in str(m.get("content") or ""))]
-    try:
-        # Blocked by the org content filter -> retry with less history (a blocked item in the
-        # history would otherwise poison every later request). Malformed tool call -> ask again.
-        level, note, reasks = 0, "", 0
-        for attempt in range(7):
-            prompt, attachments = render(trim_history(messages, level), tools)
-            answer = await ask(prompt + note, model, attachments, effort)
-            text, calls, problem = split_calls(answer) if tools else (answer, [], "")
-            if BLOCKED in answer:
-                (HERE / "blocked_prompt.txt").write_text(prompt, encoding="utf-8")  # for diagnosing the filter
-                # The filter judged the model's reply, not the prompt: replies vary, so just ask again
-                # with the full history (up to twice) before giving up context.
-                if "response violated" in answer and reasks < 2:
-                    reasks += 1
-                    print(f"reply blocked by content filter; asking again ({reasks}/2)", flush=True)
-                    continue
-                # Level 2 drops this turn's tool results; only do that when there are none, or the
-                # model forgets what it just found and loops on the same tool calls.
-                if level == 2 or (level == 1 and messages[-1]["role"] != "user"):
-                    break
-                level, note = level + 1, ""
-                print(f"blocked by content filter{answer[answer.find('(Filter reason'):][:150] if '(Filter reason' in answer else ''}; "
-                      f"retrying with less history (level {level})", flush=True)
+    # Blocked by the org content filter -> retry with less history (a blocked item in the
+    # history would otherwise poison every later request). Malformed tool call -> ask again.
+    level, note, reasks = 0, "", 0
+    for attempt in range(7):
+        prompt, attachments = render(trim_history(messages, level), tools)
+        answer = await ask(prompt + note, model, attachments, effort)
+        text, calls, problem = split_calls(answer) if tools else (answer, [], "")
+        if BLOCKED in answer:
+            (HERE / "blocked_prompt.txt").write_text(prompt, encoding="utf-8")  # for diagnosing the filter
+            # The filter judged the model's reply, not the prompt: replies vary, so just ask again
+            # with the full history (up to twice) before giving up context.
+            if "response violated" in answer and reasks < 2:
+                reasks += 1
+                print(f"reply blocked by content filter; asking again ({reasks}/2)", flush=True)
                 continue
-            if not problem or attempt == 6:
+            # Level 2 drops this turn's tool results; only do that when there are none, or the
+            # model forgets what it just found and loops on the same tool calls.
+            if level == 2 or (level == 1 and messages[-1]["role"] != "user"):
                 break
-            print(f"retrying ({problem[:120]})", flush=True)
-            note = (f"\n\n(Note: {problem}. Send your full reply again, with every ```tool block holding one "
-                    "valid JSON object on one line; arrays must use [ ].)")
-    except RuntimeError as e:
-        return JSONResponse({"error": {"message": str(e), "type": "upstream_error"}}, status_code=502)
+            level, note = level + 1, ""
+            print(f"blocked by content filter{answer[answer.find('(Filter reason'):][:150] if '(Filter reason' in answer else ''}; "
+                  f"retrying with less history (level {level})", flush=True)
+            continue
+        if not problem or attempt == 6:
+            break
+        print(f"retrying ({problem[:120]})", flush=True)
+        note = (f"\n\n(Note: {problem}. Send your full reply again, with every ```tool block holding one "
+                "valid JSON object on one line; arrays must use [ ].)")
     if BLOCKED in text and not calls:
-        text = text.strip() + ("\n\n(The task stopped here because your organization's content filter blocked the reply, "
-                               "even with earlier conversation removed. Say 'continue' to retry, or rephrase.)")
+        raise BridgeError("Your organization's content filter blocked this request or reply. Rephrase and try again.",
+                          "content_filter_error", 403)
     finish = "tool_calls" if calls else "stop"
 
-    cid, now = f"chatcmpl-{uuid.uuid4().hex}", int(time.time())
-    if not payload.get("stream"):
-        msg = {"role": "assistant", "content": text or None}
-        if calls:
-            msg["tool_calls"] = calls
-        return {"id": cid, "object": "chat.completion", "created": now, "model": model,
-                "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}
-
-    def sse():
-        base = {"id": cid, "object": "chat.completion.chunk", "created": now, "model": model}
-        deltas = [({"role": "assistant", "content": text}, None)]
-        if calls:
-            deltas.append(({"tool_calls": [{**c, "index": i} for i, c in enumerate(calls)]}, None))
-        deltas.append(({}, finish))
-        for delta, fin in deltas:
-            yield f"data: {json.dumps({**base, 'choices': [{'index': 0, 'delta': delta, 'finish_reason': fin}]})}\n\n"
-        yield "data: [DONE]\n\n"
-
-    return StreamingResponse(sse(), media_type="text/event-stream")
+    return model, text, calls, finish, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
 
 if __name__ == "__main__":

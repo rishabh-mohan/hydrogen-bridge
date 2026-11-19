@@ -45,9 +45,37 @@ To use the bridge from another machine (for example, run it on a headless server
 
 If you are signed in to several Google accounts, set `AUTHUSER` (for example `$env:AUTHUSER = "1"`) to the account index from the web app's URL (`/u/1/`).
 
+## Request reliability
+
+Browser calls run one at a time, including session recovery, so signing in cannot
+interrupt another request. Requests waiting their turn can be cancelled too.
+Disconnecting your client cancels queued work, stops retries, and aborts an active
+browser fetch. Google may already have started processing that request; aborting
+the connection cannot guarantee that remote computation stops.
+
+Set `UPSTREAM_TIMEOUT` to limit each browser fetch (default 600 seconds), and
+`REQUEST_TIMEOUT` to limit the whole chat request, including queueing, uploads,
+sign-in and retries (default 1200 seconds). Streaming clients receive keepalive
+comments while waiting; answer text still arrives once generation finishes.
+
+Errors include a specific `error.type`, a `retryable` hint, and an upstream HTTP
+status when available. Network failures, rate limits, permission denials and
+timeouts do not trigger sign-in. A 401 or explicit `UNAUTHENTICATED` response gets
+one session-recovery attempt. Other failed POSTs are not automatically replayed,
+because the server may have received them. Rate-limit HTTP responses preserve
+`Retry-After`. After streaming headers have been sent, failures are delivered as
+an SSE error object followed by `[DONE]`, rather than changing the HTTP status.
+
+Run the tests without a Google account:
+
+```powershell
+python -m playwright install chromium
+python -m unittest discover -v
+```
+
 ## Content filter
 
-Organizations can run Google's Model Armor on prompts *and* replies. When the model's reply is blocked, the bridge asks again (up to twice), since replies vary. If it is still blocked, the bridge retries with less history. If that fails too, the task stops with a note saying which filter fired. Say "continue" to try again, or rephrase.
+Organizations can run Google's Model Armor on prompts *and* replies. When the model's reply is blocked, the bridge asks again (up to twice), since replies vary. If it is still blocked, the bridge retries with less history. If that fails too, it returns a `content_filter_error` (HTTP 403, or an SSE error if streaming has started). Rephrase to try again. This is distinct from a Google permission denial and does not trigger sign-in.
 
 ## Using another organization
 
@@ -64,6 +92,7 @@ Open your Gemini Enterprise web app with your browser's dev tools open (Network 
 ## Files
 
 - `bridge.py`: the server
+- `transport.py` / `request_runtime.py`: browser calls, cancellation and errors
 - `run.ps1` / `hydrogen-manual.cmd`: the launcher
 - `opencode.json`: OpenCode provider and model settings
 
