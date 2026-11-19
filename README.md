@@ -66,6 +66,10 @@ because the server may have received them. Rate-limit HTTP responses preserve
 `Retry-After`. After streaming headers have been sent, failures are delivered as
 an SSE error object followed by `[DONE]`, rather than changing the HTTP status.
 
+Google does not report token usage, so the `usage` in each response is a rough
+estimate from the prompt and reply length (attachments are not counted). It lets
+clients such as OpenCode know when to compact a long conversation.
+
 Run the tests without a Google account:
 
 ```powershell

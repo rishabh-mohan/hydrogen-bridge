@@ -258,9 +258,28 @@ class RequestTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 403)
         self.assertEqual(json.loads(response.body)["error"]["type"], "content_filter_error")
 
+    async def test_usage_is_estimated(self):
+        import bridge
+        with patch.object(bridge, "ask", AsyncMock(return_value="a" * 40)), patch.object(bridge.Path, "write_text"):
+            response = await runtime.chat_response(self.req, self.payload, bridge.complete)
+        usage = json.loads(response.body)["usage"] if hasattr(response, "body") else response["usage"]
+        self.assertEqual(usage["completion_tokens"], 10)
+        self.assertGreater(usage["prompt_tokens"], 0)
+        self.assertEqual(usage["total_tokens"], usage["prompt_tokens"] + 10)
+        self.assertEqual(bridge.est_tokens("한국"), 2)
+
+    async def test_failed_model_lookup_does_not_block_startup(self):
+        import bridge
+        error = browser.BridgeError("denied", "permission_denied", 403, upstream_status=403)
+        with patch.object(bridge, "api", AsyncMock(side_effect=error)):
+            await bridge.discover_models()
+        self.assertEqual(bridge.state["models"], {})
+        self.assertIn(bridge.DEFAULT_MODEL, [m["id"] for m in (await bridge.models())["data"]])
+
     async def test_invalid_payload_is_rejected(self):
         complete = AsyncMock()
-        for payload in (None, {}, {"messages": []}, {"messages": [1]}, {**self.payload, "model": 123}):
+        for payload in (None, {}, {"messages": []}, {"messages": [1]}, {**self.payload, "model": 123},
+                        {**self.payload, "tools": {"type": "function"}}):
             response = await runtime.chat_response(self.req, payload, complete)
             self.assertEqual(response.status_code, 400)
         complete.assert_not_awaited()

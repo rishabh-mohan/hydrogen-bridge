@@ -63,8 +63,9 @@ async def chat_response(req, payload, complete):
         return JSONResponse({"error": {"message": "messages must be a nonempty array", "type": "invalid_request_error"}}, status_code=400)
     if (any(not isinstance(m, dict) or not isinstance(m.get("role"), str) for m in payload["messages"])
             or any(payload.get(k) is not None and not isinstance(payload[k], str)
-                   for k in ("model", "reasoning_effort"))):
-        return JSONResponse({"error": {"message": "Invalid message, model, or reasoning_effort", "type": "invalid_request_error"}}, status_code=400)
+                   for k in ("model", "reasoning_effort"))
+            or not isinstance(payload.get("tools") or [], list)):
+        return JSONResponse({"error": {"message": "Invalid message, model, reasoning_effort, or tools", "type": "invalid_request_error"}}, status_code=400)
     cid, now = f"chatcmpl-{uuid.uuid4().hex}", int(time.time())
     if not payload.get("stream"):
         job = asyncio.create_task(run_completion(complete, payload))

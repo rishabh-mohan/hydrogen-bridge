@@ -44,6 +44,7 @@ if ($BridgeOnly) {
 # OpenCode is a Node package; make sure node and global npm bins are reachable.
 $env:Path = "C:\Program Files\nodejs;$env:APPDATA\npm;$env:Path"
 $env:OPENCODE_CONFIG = "$PSScriptRoot\opencode.json"
+$env:HYDROGEN_PORT = "$Port"  # opencode.json reads the bridge port from this
 
 Push-Location $Project
 try {

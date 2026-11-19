@@ -366,7 +366,10 @@ async def discover_models():
     """Ask Gemini Enterprise which models this org's web app offers ({id: display name})."""
     body = {"configId": CONFIG_ID, "additionalParams": {"token": "-", "origin": "ORIGIN_UNSPECIFIED"},
             "widgetConfigId": CONFIG_ID, "modelInfoView": "END_USER_WEB"}
-    r = await api(f"{API}/v1alpha/locations/us/lookupWidgetConfig?key={WEB_KEY}", json.dumps(body))
+    try:
+        r = await api(f"{API}/v1alpha/locations/us/lookupWidgetConfig?key={WEB_KEY}", json.dumps(body))
+    except BridgeError as e:  # the model list is optional; never block startup on it
+        r = {"status": e.upstream_status or e.kind, "text": ""}
 
     def find(x):
         if isinstance(x, dict):
@@ -397,8 +400,6 @@ def widget(method, request_key, request):
 async def upload_files(attachments):
     """Create a session and upload each (name, base64) into it. Returns (session_name, file_ids)."""
     r = await api(*widget("widgetCreateSession", "createSessionRequest", {"session": {"name": "-", "displayName": ""}}))
-    if r["status"] != 200:
-        raise RuntimeError(f"creating a session for uploads failed: HTTP {r['status']}: {r['text'][:300]}")
     session = json.loads(r["text"])["session"]["name"]
     url = f"{API}/upload/v1alpha/{PROJECT}/{session}:uploadFile?key={WEB_KEY}"
     ids = []
@@ -407,13 +408,11 @@ async def upload_files(attachments):
         start = await api(url, "", content_type="application/x-www-form-urlencoded;charset=UTF-8", headers={
             "x-goog-upload-protocol": "resumable", "x-goog-upload-command": "start",
             "x-goog-upload-file-name": name, "x-goog-upload-header-content-length": str(size)})
-        if start["status"] != 200 or not start.get("uploadUrl"):
-            raise RuntimeError(f"upload of {name} failed to start: HTTP {start['status']}: {start['text'][:300]}")
+        if not start.get("uploadUrl"):
+            raise BridgeError(f"Google did not accept the upload of {name}.", upstream_status=start["status"])
         done = await api(start["uploadUrl"], b64=b64, content_type="application/x-www-form-urlencoded;charset=utf-8",
                          headers={"x-goog-upload-command": "upload, finalize", "x-goog-upload-offset": "0",
                                   "x-goog-upload-file-name": name})
-        if done["status"] != 200:
-            raise RuntimeError(f"upload of {name} failed: HTTP {done['status']}: {done['text'][:300]}")
         ids.append(json.loads(done["text"])["fileId"])
         print(f"uploaded {name} ({size} bytes)", flush=True)
     return session, ids
@@ -442,8 +441,6 @@ async def ask(prompt, model, attachments=(), effort=None):
         body["streamAssistRequest"]["generationSpec"] = {"thinkingConfig": {"thinkingLevel": effort}}
     r = await api(ENDPOINT, json.dumps(body))
     (HERE / "last_response.txt").write_text(f"HTTP {r['status']}\n{r['text']}", encoding="utf-8")
-    if r["status"] != 200:
-        raise RuntimeError(f"Gemini Enterprise returned HTTP {r['status']}: {r['text'][:500]}")
     try:
         answer = extract(r["text"])
     except (ValueError, TypeError, KeyError) as exc:
@@ -553,8 +550,18 @@ async def complete(payload):
         raise BridgeError("Your organization's content filter blocked this request or reply. Rephrase and try again.",
                           "content_filter_error", 403)
     finish = "tool_calls" if calls else "stop"
+    # Clients such as OpenCode compact the conversation based on usage, so zeros would let it grow unbounded.
+    p, c = est_tokens(prompt), est_tokens(answer)
+    return model, text, calls, finish, {"prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c}
 
-    return model, text, calls, finish, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+def est_tokens(text):
+    """Rough count (Google returns no usage): ~4 ASCII chars per token, 1 per other char.
+
+    shortcut: ignores attachments and server-side context; use a real tokenizer if exact counts matter.
+    """
+    ascii_chars = sum(ch < "\x80" for ch in text)
+    return (ascii_chars + 3) // 4 + len(text) - ascii_chars
 
 
 if __name__ == "__main__":
