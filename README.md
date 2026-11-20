@@ -6,7 +6,7 @@ It runs a small local server that looks like the OpenAI API to other tools. Each
 
 Set up for **Purdue's** Gemini Enterprise out of the box. Other organizations can point it at their own setup; see [below](#using-another-organization).
 
-> **Unofficial.** This drives the web app the way a browser does. It is not a supported Google API, and it may break when the site changes. Your organization's acceptable-use policy and Google's terms still apply, so use it at your own risk.
+> **Unofficial.** It uses the web app the way a browser does, so it may break when the site changes. It is not an official Google integration. Follow your organization's AI guidelines.
 
 ## What you get
 
